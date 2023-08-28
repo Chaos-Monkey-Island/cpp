@@ -1,0 +1,560 @@
+#include <limits.h>
+#include <TelemetryReceiver.hpp>
+#include <TelemetryMessage.hpp>
+#include <SerializationUtils.hpp>
+#include <arpa/inet.h>
+
+using SerializationLibrary::Deserialize_T;
+using SerializationLibrary::BIG_ENDIAN;
+using DataElementLibrary::Element;
+
+namespace Telemetry
+{
+// Static Analysis notes:
+//
+// 59 D: Parameter should be declared const.
+// SequenceNum
+// Resync
+// Cycles
+//
+// These are false warnings. These must be non-const references because TelemetryReceiver intends to modify these
+// elements' values, just not during this function.
+
+/*LDRA_INSPECTED 59 D 3*/
+/*LDRA_INSPECTED 59 D 4*/
+/*LDRA_INSPECTED 59 D 5*/
+TlmRxPacketHandler::TlmRxPacketHandler(const uint32_t id,
+                                       const uint16_t minSize,
+                                       const TlmRxPacketHandlerExpansion& expansion,
+                                       TelemetryPacketDeserializer deserializer)
+    : id(id),
+      minSize(minSize),
+      lastSequenceNumber(expansion.lastSequenceNumber.src),
+      processedEver(false),
+      resyncThreshold(expansion.resyncThreshold.src),
+      cyclesSinceLastReceipt(expansion.cyclesSinceLastReceipt.src),
+      _deserialize(deserializer)
+
+{
+    // process initializer list but don't do anything fancy
+}
+
+bool TlmRxPacketHandler::Deserialize(const uint8_t* const buffer, const uint16_t length)
+{
+    return _deserialize(buffer, length);
+}
+
+TelemetryReceiverConfig::TelemetryReceiverConfig(const NetworkAddressUnion* const bindAddress,
+                                                 const Ipv4Address_t multicastAddress,
+                                                 const uint16_t maxMessagesPerCycle,
+                                                 const TelemetryReceiverConfigExpansion& expansion)
+    : bindAddress(bindAddress),
+      multicastGroup(multicastAddress),
+      maxMessagesPerCycle(maxMessagesPerCycle),
+      headerErrorCount(expansion.headerErrorCount.src),
+      unknownErrorCount(expansion.unknownErrorCount.src),
+      duplicateErrorCount(expansion.duplicateErrorCount.src),
+      orderErrorCount(expansion.orderErrorCount.src),
+      payloadErrorCount(expansion.payloadErrorCount.src),
+      totalDiscardedCount(expansion.totalDiscardedCount.src),
+      validCount(expansion.validCount.src),
+      networkErrorCount(expansion.networkErrorCount.src)
+
+{
+    // process initializer list but don't do anything fancy
+}
+
+// Static Analysis notes:
+//
+// 120 D: Parameter should be declared pointer to const.
+// packetList
+//
+// This is a false warning. This pointer is intended to be used modify these objects, just not during this function.
+
+/*LDRA_INSPECTED 120 D 1*/
+TelemetryReceiver::TelemetryReceiver(TlmRxPacketHandler* const handlerList,
+                                     const size_t handlerCount,
+                                     const TelemetryReceiverConfig& configuration)
+    : AppDirector::IApplication(),
+      _handlers(handlerList),
+      _numHandlers(handlerCount),
+      _config(configuration),
+      _network(0)
+{
+    // process initializer list but don't do anything fancy
+}
+
+TelemetryReceiver::TelemetryReceiver(const TelemetryReceiver& receiver)
+    : AppDirector::IApplication(),
+      _handlers(receiver._handlers),
+      _numHandlers(receiver._numHandlers),
+      _config(receiver._config),
+      _network(receiver._network)
+{
+    // process initializer list but don't do anything fancy
+}
+
+bool TelemetryReceiver::initialize(void)
+{
+    _config.headerErrorCount.write(0);
+    _config.unknownErrorCount.write(0);
+    _config.duplicateErrorCount.write(0);
+    _config.orderErrorCount.write(0);
+    _config.payloadErrorCount.write(0);
+    _config.totalDiscardedCount.write(0);
+    _config.validCount.write(0);
+    _config.networkErrorCount.write(0);
+
+    for (size_t i = 0U; i < _numHandlers; ++i)
+    {
+        TlmRxPacketHandler* pHandler = &_handlers[i]; /* the ith packet handler */
+
+        // Static Analysis notes:
+        //
+        // 70 D == "DU anomaly": variable is not used
+        // (pHandler)->lastSequenceNumber
+        // (pHandler)->cyclesSinceLastReceipt
+        // (pHandler)->processedEver
+        //
+        // This is a false warning. This value remains the same until the next call to step, where it is used.
+
+        /*LDRA_INSPECTED 70 D*/
+        pHandler->lastSequenceNumber.write(0);
+
+        /*LDRA_INSPECTED 70 D*/
+        pHandler->cyclesSinceLastReceipt.write(UINT16_MAX);
+
+        /*LDRA_INSPECTED 70 D*/
+        pHandler->processedEver = false;
+    }
+
+    // Static Analysis notes:
+    //
+    // 94 D: Named variable declared but not used in code.
+    // _config.bindAddress
+    // _config.duplicateErrorCount
+    // _config.headerErrorCount
+    // _config.maxMessagesPerCycle
+    // _config.networkErrorCount
+    // _config.payloadErrorCount
+    // _config.unknownErrorCount
+    // _config.validCount
+    //
+    // This is a false warning. Some are used here and either way, these are not declared in this scope,
+    // issue reported to LDRA.
+
+    /*LDRA_INSPECTED 94 D*/
+    Result_t result = networkOpen(&_network,
+                                  _config.bindAddress,
+                                  _config.maxMessagesPerCycle); /* result of opening the network */
+    if(result == SUCCESS)
+    {
+        if(true == isMulticast(_config.multicastGroup))
+        {
+            result = networkJoin(_network, _config.multicastGroup);
+        }
+    }
+    return result == SUCCESS;
+}
+
+void TelemetryReceiver::step(void)
+{
+    StartStep();
+
+    for(uint16_t i = 0U; i < _config.maxMessagesPerCycle; ++i)
+    {
+        // Static Analysis notes:
+        //
+        // 93 D: Local variable should be declared const.
+        // received
+        // receivedBytes
+        // receivedFrom
+        //
+        // This is a false warning. This value is modified by networkReceiveFrom.
+
+        /*LDRA_INSPECTED 93 D*/
+        bool received = false; /* whether a message was received */
+        /*LDRA_INSPECTED 93 D*/
+        size_t receivedBytes = 0U; /* how large the message is, if received */
+        /*LDRA_INSPECTED 93 D*/
+        NetworkAddressUnion receivedFrom = {}; /* the sender of the message */
+
+        // if we haven't reached the maximum messages per cycle, check for more messages
+        const Result_t result = networkReceiveFrom(_network,
+                                                   _messageBuffer,
+                                                   kMaxMessageSize,
+                                                   &received,
+                                                   &receivedBytes,
+                                                   &receivedFrom); /* the result of reading from the network */
+
+        if((result == SUCCESS) && received)
+        {
+            // Static Analysis notes:
+            //
+            // 531 S: Literal zero used in pointer context.
+            // pHandler = 0
+            //
+            // Conflict between coding standards and LDRA. Coding standards prevent use of NULL.
+
+            /*LDRA_INSPECTED 531 S*/
+            TlmRxPacketHandler* pHandler = 0; /* The handler for the current packet. 0, if one hasn't been found yet */
+
+            // Static Analysis notes:
+            //
+            // 69 D: UR anomaly, variable used before assignment.
+            // id
+            // msgSequence
+            //
+            // These variables are written before reading in DeserializeHeader(). There aren't "safe" values to
+            // intialize these to and initializing them here would hide logic errors in DeserializeHeader() (if it is
+            // modified to return true without filling them in, code is added to actuall read them before initializing)
+            // if we change to a more intelligent static analysis tool.
+
+            /*LDRA_INSPECTED 69 D*/
+            uint32_t id; /* the message ID */
+            /*LDRA_INSPECTED 69 D*/
+            uint16_t msgSequence; /* the sequence number for the message */
+
+            if(false == DeserializeHeader(receivedBytes, id, msgSequence))
+            {
+                continue;
+            }
+
+            // Static Analysis notes:
+            //
+            // 45 D: Pointer not checked for null before use.
+            // pHandler
+            //
+            // This is a false warning. This reference is filled in by the code in the caller and is not used before
+            // being set to a valid value.
+
+            /*LDRA_INSPECTED 45 D*/
+            if(false == FindAndCheckHandler(pHandler, id, receivedBytes))
+            {
+                continue;
+            }
+
+            if(false == CheckSequence(msgSequence, pHandler))
+            {
+                continue;
+            }
+
+            // everything checks out, pass it on to the handler
+
+            // Static Analysis notes:
+            //
+            // 70 D == "DU anomaly": variable is not used
+            // (pHandler)->processedEver
+            //
+            // This is a false warning. This value remains set until the resync condition is met in a subsequent step
+
+            /*LDRA_INSPECTED 70 D*/
+            HandlePacket(pHandler, receivedBytes, msgSequence);
+        }
+        else
+        {
+            // no more messages or network stack failure
+            if(result != SUCCESS)
+            {
+                // network stack failure
+                IncrementCounter(_config.networkErrorCount);
+            }
+            // Static Analysis notes:
+            //
+            // 31 S: Use of break statement in loop.
+            //
+            // The control logic of this loop is very simply limiting the number of calls to networkReceiveFrom.
+            // Adding this logic to the loop definition would complicate the loop termination logic. I think this
+            // single break is simpler and easy to understands.
+
+            /*LDRA_INSPECTED 31 S*/
+            break;
+        }
+    }
+}
+
+bool TelemetryReceiver::CheckSequence(const uint16_t msgSequence, const TlmRxPacketHandler* const pHandler)
+{
+    bool later = false;
+
+    // check sequence
+    const uint16_t lastSequence =
+        pHandler->lastSequenceNumber.read(); /* the sequence number of the last message of this type */
+
+    const RFC1982 comparison =
+        RFC1982Compare(msgSequence, lastSequence); /* result of the RFC1982 comparison */
+
+    if((comparison == RFC1982_lessThan) && pHandler->processedEver)
+    {
+        // sequence < lastSequence
+        IncrementCounter(_config.orderErrorCount);
+        IncrementCounter(_config.totalDiscardedCount);
+    }
+    else if((comparison == RFC1982_equal) && pHandler->processedEver)
+    {
+        // duplicate
+        IncrementCounter(_config.duplicateErrorCount);
+        IncrementCounter(_config.totalDiscardedCount);
+    }
+    else if((comparison == RFC1982_greaterThan) || (!pHandler->processedEver))
+    {
+        // sequence > lastSequence or
+        // resync condition/never processed
+        later = true;
+    }
+    else
+    {
+      // logically impossible because private helper RFC1982Compare cannot return other values
+    }
+
+    return later;
+}
+
+// Static Analysis notes:
+//
+// 59 D: Parameter should be declared const.
+// id
+// msgSequence
+//
+// This is a false warning. These references are intended to be used to modify the values of the passed arguments.
+
+/*LDRA_INSPECTED 59 D 2*/
+/*LDRA_INSPECTED 59 D 3*/
+bool TelemetryReceiver::DeserializeHeader(const size_t receivedBytes,
+                                          uint32_t& id,
+                                          uint16_t& msgSequence)
+{
+    bool passedChecks = true; /* whether or not the past checks have all passed */
+
+    // validate header
+    if(receivedBytes < sizeof(TelemetryHeader))
+    {
+        // packet can't even hold the header
+        IncrementCounter(_config.headerErrorCount);
+        IncrementCounter(_config.totalDiscardedCount);
+        passedChecks = false;
+    }
+
+    if(passedChecks)
+    {
+        uint16_t length = 0U; /* length of the payload */
+        uint8_t version = 0xFFU; /* the message version */
+
+        Deserialize_T<BIG_ENDIAN, uint8_t>(&_messageBuffer[offsetof(TelemetryHeader, version)], &version);
+
+        Deserialize_T<BIG_ENDIAN, uint16_t>(&_messageBuffer[offsetof(TelemetryHeader, len)], &length);
+
+        if((version != 0U) ||
+           (length < sizeof(uint8_t)) ||
+           (receivedBytes < (sizeof(TelemetryHeader) + length)))
+        {
+            // version is wrong or
+            // payload length is smaller than the minimum payload (uint8) or
+            // message isn't long enough told the payload as claimed
+            IncrementCounter(_config.headerErrorCount);
+            IncrementCounter(_config.totalDiscardedCount);
+            passedChecks = false;
+        }
+    }
+
+    if(passedChecks)
+    {
+        Deserialize_T<BIG_ENDIAN, uint32_t>(&_messageBuffer[offsetof(TelemetryHeader, id)], &id);
+
+        Deserialize_T<BIG_ENDIAN, uint16_t>(&_messageBuffer[offsetof(TelemetryHeader, sequenceNumber)], &msgSequence);
+    }
+
+    return passedChecks;
+}
+
+void TelemetryReceiver::IncrementCounter(Element<uint32_t>& counter) const
+{
+    counter.write(counter.read() + 1);
+}
+
+TelemetryReceiver::RFC1982 TelemetryReceiver::RFC1982Compare(const uint16_t sequence,
+                                                             const uint16_t lastSequence) const
+{
+    // This comparison is described in: https://tools.ietf.org/html/rfc1982#section-3.2
+    static const uint16_t threshold = 0x8000U; /* 2^15 (half of the 16 bit number space) */
+    RFC1982 comparison = RFC1982_lessThan; /* result of the RFC1982 comparison */
+
+    if(((sequence < lastSequence) && ((lastSequence - sequence) < threshold)) ||
+       ((sequence > lastSequence) && ((sequence - lastSequence) > threshold)))
+    {
+        // sequence < lastSequence
+        comparison = RFC1982_lessThan;
+    }
+    else if(((sequence < lastSequence) && ((lastSequence - sequence) > threshold)) ||
+            ((sequence > lastSequence) && ((sequence - lastSequence) < threshold)))
+    {
+        // sequence > lastSequence
+        comparison = RFC1982_greaterThan;
+    }
+    else if(sequence == lastSequence)
+    {
+        // duplicate
+        comparison = RFC1982_equal;
+    }
+    else
+    {
+        // this is the indeterminable case called out by RFC1982
+        // the standard leaves the definition up to the implementation
+        // TLM_RX handles this as sequence < lastSequence
+        comparison = RFC1982_lessThan;
+    }
+
+    return comparison;
+}
+
+// Static Analysis notes:
+//
+// 120 D: Pointer param should be declared pointer to const.
+// pHandler
+//
+// This is a false warning. This pointer is intended to be used to modify the value of the passed argument.
+
+/*LDRA_INSPECTED 120 D 1*/
+void TelemetryReceiver::HandlePacket(TlmRxPacketHandler* const pHandler,
+                                     const size_t receivedBytes,
+                                     const uint16_t msgSequence)
+{
+    const bool deserialized =
+        pHandler->Deserialize(_messageBuffer,
+                              static_cast<uint16_t>(receivedBytes)); /* whether deserialization was successful */
+
+    if(!deserialized)
+    {
+        IncrementCounter(_config.payloadErrorCount);
+        IncrementCounter(_config.totalDiscardedCount);
+    }
+    else
+    {
+        // Static Analysis notes:
+        //
+        // 70 D == "DU anomaly": variable is not used
+        // (pHandler)->cyclesSinceLastReceipt
+        // (pHandler)->lastSequenceNumber
+        //
+        // This is a false warning. This value remains the same until the next call to step, where it is used.
+
+        /*LDRA_INSPECTED 70 D*/
+        pHandler->cyclesSinceLastReceipt.write(0U);
+        pHandler->processedEver = true;
+
+        /*LDRA_INSPECTED 70 D*/
+        pHandler->lastSequenceNumber.write(msgSequence);
+
+        IncrementCounter(_config.validCount);
+    }
+}
+
+// Static Analysis notes:
+//
+// 120 D: Pointer param should be declared pointer to const.
+// pHandler
+//
+// This is a false warning. This pointer is intended to be used to modify the value of the passed argument.
+
+/*LDRA_INSPECTED 120 D 1*/
+bool TelemetryReceiver::FindAndCheckHandler(TlmRxPacketHandler*& pHandler,
+                                            const uint32_t id,
+                                            const size_t receivedBytes)
+{
+    bool succeeded = false; /* whether or not the previous steps have succeeded */
+
+    for (size_t i = 0U; i < _numHandlers; ++i)
+    {
+        pHandler = &_handlers[i];
+
+        // Static Analysis notes:
+        //
+        // 45 D: Pointer not checked for null before use.
+        // pHandler
+        //
+        // This is a false warning. This array and bound is created by ICM and passed into the recevier. It will not
+        // be null.
+
+        /*LDRA_INSPECTED 45 D*/
+        if(pHandler->id == id)
+        {
+            succeeded = true;
+
+            // Static Analysis notes:
+            //
+            // 31 S: Use of break statement in loop.
+            //
+            // The control logic of this loop is very simply limiting the search to the number of registered handlers
+            // Adding a check for success == true to the loop termination logic causes:
+            // DATAFLOW VIOLATION 38 D : More than one control variable for loop.
+            // Instead of suppressing that error and complicating the loop logic, I'm leaving it simpler and
+            // suppressing the warning about the break statement.
+
+            /*LDRA_INSPECTED 31 S*/
+            break;
+        }
+    }
+
+    if(!succeeded)
+    {
+        // unknown ID
+        IncrementCounter(_config.unknownErrorCount);
+        IncrementCounter(_config.totalDiscardedCount);
+    }
+
+    if(succeeded && (receivedBytes < pHandler->minSize))
+    {
+        // the handler needs more data than is contained in the packet
+        IncrementCounter(_config.headerErrorCount);
+        IncrementCounter(_config.totalDiscardedCount);
+        succeeded = false;
+    }
+
+    if(succeeded && (pHandler->cyclesSinceLastReceipt.read() == 0))
+    {
+        // already processed
+        IncrementCounter(_config.duplicateErrorCount);
+        IncrementCounter(_config.totalDiscardedCount);
+        succeeded = false;
+    }
+
+    return succeeded;
+}
+
+// Static Analysis notes:
+//
+// 65 D: Void function has no side effects.
+//
+// This is a false warning. This updates various state in the handlers which is used during the step function.
+
+/*LDRA_INSPECTED 65 D*/
+void TelemetryReceiver::StartStep() const
+{
+    // clear received this step, check for resync
+    for (size_t i = 0U; i < _numHandlers; ++i)
+    {
+        TlmRxPacketHandler* const pHandler = &_handlers[i]; /* the ith handler in the list */
+        if(pHandler->cyclesSinceLastReceipt.read() < UINT16_MAX)
+        {
+            pHandler->cyclesSinceLastReceipt.write(
+                    pHandler->cyclesSinceLastReceipt.read() + 1);
+        }
+
+        if(pHandler->cyclesSinceLastReceipt.read() > pHandler->resyncThreshold.read())
+        {
+            // resync condition, tlm_rx should treat this message as if it has never been seen
+
+            // Static Analysis notes:
+            //
+            // 70 D: DU anomaly, variable value is not used.
+            // (pHandler)->processedEver
+            //
+            // This is a false warning. This value is set here and used in ::step().
+
+            /*LDRA_INSPECTED 70 D*/
+            pHandler->processedEver = false;
+        }
+    }
+}
+
+} // namepsace
